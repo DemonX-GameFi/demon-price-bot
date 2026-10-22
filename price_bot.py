@@ -69,6 +69,23 @@ def send_photo(token,chat,png,caption):
     with urllib.request.urlopen(req,timeout=40) as r:
         result=json.load(r)
     if not result.get('ok'):raise RuntimeError('Telegram sendPhoto failed')
+    message_id=result.get('result',{}).get('message_id')
+    if not isinstance(message_id,int):raise RuntimeError('Telegram sendPhoto response missing message_id')
+    return message_id
+
+def delete_previous_photo(token,chat,message_id):
+    payload=urllib.parse.urlencode({'chat_id':chat,'message_id':message_id}).encode()
+    req=urllib.request.Request(f'https://api.telegram.org/bot{token}/deleteMessage',data=payload,method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=30) as r:
+            result=json.load(r)
+        if not result.get('ok'):
+            print(f'WARNING: Could not delete previous price message {message_id}: Telegram returned not ok')
+        else:
+            print(f'Deleted previous price message {message_id}')
+    except Exception as exc:
+        # Sending succeeded. Do not retry the send or fail the workflow because an old message is undeletable.
+        print(f'WARNING: Could not delete previous price message {message_id}: {exc}')
 
 def main():
     pool=choose_pool()
@@ -87,7 +104,7 @@ def main():
     cutoff=max(last_checked,now-timedelta(minutes=90))
     fresh=[t for t in trades if cutoff<t[0]<=now]
     if not fresh:
-        STATE.write_text(json.dumps({'pool':pool,'last_checked_at':now.isoformat()},indent=2)+'\n')
+        STATE.write_text(json.dumps({**old,'pool':pool,'last_checked_at':now.isoformat()},indent=2)+'\n')
         print('No new trades since last check; skipped message')
         return
     candles=candles_for(pool)
@@ -106,8 +123,15 @@ def main():
              f'📈 https://www.geckoterminal.com/bsc/pools/{pool}\nData: GeckoTerminal')
     token=os.environ['TELEGRAM_BOT_TOKEN'].strip();chat=os.environ['TELEGRAM_CHAT_ID'].strip()
     if not token or not chat:raise RuntimeError('Missing Telegram secrets')
-    send_photo(token,chat,make_chart(candles),caption)
-    STATE.write_text(json.dumps({'pool':pool,'last_checked_at':now.isoformat()},indent=2)+'\n')
+    new_message_id=send_photo(token,chat,make_chart(candles),caption)
+    previous_id=old.get('last_price_message_id')
+    # Save the new ID before attempting deletion, so later runs only target this bot's own price messages.
+    STATE.write_text(json.dumps({'pool':pool,'last_checked_at':now.isoformat(),
+                                 'last_price_message_id':new_message_id},indent=2)+'\n')
+    if isinstance(previous_id,int) and previous_id!=new_message_id:
+        delete_previous_photo(token,chat,previous_id)
+    elif previous_id is None:
+        print('No previously tracked price message; nothing to delete')
     print(f'Sent chart for {len(fresh)} new trades; state advanced')
 
 if __name__=='__main__':main()
