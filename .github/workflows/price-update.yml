@@ -1,19 +1,25 @@
 name: DEMON Hourly Price Update
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '17 * * * *'
+
 permissions:
   contents: write
+
+# A manual run and an hourly run must never update the same state in parallel.
 concurrency:
   group: demon-price-state
   cancel-in-progress: false
+
 jobs:
   send-price:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           persist-credentials: true
       - uses: actions/setup-python@v5
         with:
@@ -25,14 +31,54 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python price_bot.py
-      - name: Save last checked time to repository
+      - name: Save state to repository (retry on concurrent commits)
+        shell: bash
         run: |
-          if [[ -f last_trade.json ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add last_trade.json
-            if ! git diff --cached --quiet; then
-              git commit -m "chore: update DEMON trade check state [skip ci]"
-              git push
-            fi
+          set -euo pipefail
+          if [[ ! -f last_trade.json ]]; then
+            echo 'No last_trade.json to save'
+            exit 0
           fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          cp last_trade.json "$RUNNER_TEMP/demon_local_state.json"
+
+          for attempt in 1 2 3 4; do
+            echo "State push attempt ${attempt}/4"
+            git fetch origin main
+            # Refresh only after the Telegram step; preserve local state in RUNNER_TEMP.
+            git reset --hard origin/main
+            LOCAL_STATE="$RUNNER_TEMP/demon_local_state.json" python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from pathlib import Path
+
+          local = json.loads(Path(os.environ['LOCAL_STATE']).read_text())
+          path = Path('last_trade.json')
+          remote = json.loads(path.read_text()) if path.exists() else {}
+          if remote.get('pool') and remote['pool'].lower() != local['pool'].lower():
+              raise RuntimeError('Remote pool differs: refusing to replace state')
+          def stamp(record):
+              value = record.get('last_checked_at')
+              return datetime.fromisoformat(value.replace('Z', '+00:00')) if value else None
+          if stamp(remote) is not None and stamp(remote) >= stamp(local):
+              print('Remote state is equally recent or newer; leaving it unchanged')
+          else:
+              path.write_text(json.dumps(local, indent=2) + '\n')
+              print('Prepared locally generated state for commit')
+          PY
+            git add last_trade.json
+            if git diff --cached --quiet; then
+              echo 'No newer state to commit'
+              exit 0
+            fi
+            git commit -m 'chore: update DEMON trade check state [skip ci]'
+            if git push origin HEAD:main; then
+              echo 'DEMON state saved successfully'
+              exit 0
+            fi
+            echo 'Remote branch advanced; retrying with its latest commit'
+            sleep 2
+          done
+          echo 'ERROR: Unable to save DEMON state after 4 attempts' >&2
+          exit 1
